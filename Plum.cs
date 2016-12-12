@@ -4,16 +4,19 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
 namespace Saleae
 {
+
     public class Plum
     {
-
+        [JsonProperty]
         private List<LightPad> LightPads; //these are the physical lightpads.
+        [JsonProperty]
         private List<Light> Lights; //these are the logical loads.
         public void ScanForDevices(string email, string password)
         {
@@ -31,10 +34,10 @@ namespace Saleae
             socket.SendTo(broadcast_data, 0, broadcast_data.Count(), SocketFlags.None, broadcast_ep);
 
             LightPads = new List<LightPad>();
-
+            Lights = new List<Light>();
             try
             {
-                // while (true)
+                while (true)
                 {
                     EndPoint response_ep = new IPEndPoint(IPAddress.Any, 0);
                     byte[] rx_buffer = new byte[2048];
@@ -45,15 +48,14 @@ namespace Saleae
                     if (LightPads.Any(x => x.Id == lightpad_id) == false)
                     {
                         IPEndPoint new_ep = new IPEndPoint((response_ep as IPEndPoint).Address, int.Parse(elements[3]));
-                        LightPads.Add(new LightPad(new_ep, elements[2]));
+                        LightPads.Add(new LightPad(new_ep.Address.MapToIPv4().ToString(), new_ep.Port, elements[2], ""));
                         Console.WriteLine("Found " + LightPads.Count() + " so far...");
                     }
                 }
             }
-            catch (SocketException ex)
+            catch (SocketException)
             {
                 //timeout exception. Normal.    
-                //Console.WriteLine("socket error: " + ex.Message);
             }
             finally
             {
@@ -67,12 +69,13 @@ namespace Saleae
             client.DefaultRequestHeaders.UserAgent.ParseAdd("Plum/2.3.0 (iPhone; iOS 9.2.1; Scale/2.00)");
             client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", Convert.ToBase64String(auth_bytes));
 
-
+            string home_access_token = null;
             try
             {
                 var response = client.GetAsync("https://production.plum.technology/v2/getHouses"); //returns an array of house IDs in JSON format.
                 string house_list_json = response.Result.Content.ReadAsStringAsync().Result;
                 var house_list = Newtonsoft.Json.Linq.JArray.Parse(house_list_json).Values<string>();
+
 
                 foreach (string house_id in house_list)
                 {
@@ -80,7 +83,7 @@ namespace Saleae
                         JsonConvert.SerializeObject(new { hid = house_id }), Encoding.UTF8, "application/json"
                     ));
                     dynamic house_detail = JObject.Parse(response.Result.Content.ReadAsStringAsync().Result);
-
+                    home_access_token = house_detail.house_access_token;
                     foreach (string room_id in house_detail.rids)
                     {
                         response = client.PostAsync("https://production.plum.technology/v2/getRoom", new StringContent(
@@ -98,60 +101,98 @@ namespace Saleae
                             Console.WriteLine("room detail: " + room_detail);
                             Console.WriteLine("house detail: " + house_detail);
                             List<LightPad> light_pads = new List<LightPad>();
- 
-                            foreach( string lightpad_id in load_detail.lpids)
+
+                            foreach (string lightpad_id in load_detail.lpids)
                             {
-                                light_pads.Add(LightPads.Single( x => x.Id == lightpad_id ));
+                                light_pads.Add(LightPads.Single(x => x.Id == lightpad_id));
                             }
-                            Lights.Add( new Light(
-                                load_detail.llid,
-                                load_detail.logical_load_name,
-                                room_detail.rid,
-                                room_detail.room_name,
-                                house_detail.hid,
-                                house_detail.house_name,
-                                house_detail.house_access_token,
+
+                            Lights.Add(new Light(
+                                load_detail.llid.Value,
+                                load_detail.logical_load_name.Value,
+                                room_detail.rid.Value,
+                                room_detail.room_name.Value,
+                                house_detail.hid.Value,
+                                house_detail.house_name.Value,
+                                house_detail.house_access_token.Value,
                                 light_pads
                             ));
                         }
                     }
                 }
-
-
             }
             catch (Exception ex)
             {
                 Console.WriteLine("failed: " + ex.Message);
             }
 
-            Console.WriteLine("Done");
+            for (int i = 0; i < LightPads.Count(); ++i)
+                LightPads[i].HomeAccessToken = home_access_token;
 
+            Console.WriteLine("Done");
         }
 
-        public void LoadData(string path)
+        public bool LoadData(string path)
         {
+            Plum loaded_plum = null;
+            try
+            {
+                string json = System.IO.File.ReadAllText(path);
+                loaded_plum = JsonConvert.DeserializeObject<Plum>(json);
+            }
+            catch (Exception ex)
+            {
+                return false;
+            }
 
+            this.Lights = loaded_plum.Lights;
+            this.LightPads = loaded_plum.LightPads;
+            return true;
         }
 
         public void SaveData(string path)
         {
-
+            string save_content = JsonConvert.SerializeObject(this);
+            System.IO.File.WriteAllText(path, save_content);
         }
 
+        //brightness between 0 an 100.
+        public void SetAllLights( double brightness )
+        {
+            if( brightness > 100 )
+                brightness = 100;
+            if( brightness < 0 )
+                brightness = 0;
+            
+            byte level = (byte)(brightness / 100.0 * 255);
+            for( int i = 0; i < Lights.Count(); ++i)
+            {
+                Lights[i].Brightness = level;
+            }
+        }
 
-
+        public double[] GetAllLights()
+        {
+            double[] levels = new double[Lights.Count()];
+            for( int i = 0; i < Lights.Count(); ++i)
+            {
+                levels[i] = (double)Lights[i].Brightness / 255.0 * 100.0;
+            }
+            return levels;
+        }
 
         public class Light
         {
-            public Light( string id, string name, string room_id, string room_name, string house_id, string house_name, string house_token, List<LightPad> light_pads )
+            public Light(string logicalloadid, string name, string roomid, string roomname, string houseid, string housename, string housetoken, List<LightPad> light_pads)
             {
-                LogicalLoadId = id;
+                //parameter names probably need to match variable names in order for json to load readonly feilds.
+                LogicalLoadId = logicalloadid;
                 Name = name;
-                RoomId = room_id;
-                RoomName = room_name;
-                HouseId = house_id;
-                HouseName = house_name;
-                HouseToken = house_token;
+                RoomId = roomid;
+                RoomName = roomname;
+                HouseId = houseid;
+                HouseName = housename;
+                HouseToken = housetoken;
                 LightPads = light_pads;
             }
 
@@ -162,37 +203,67 @@ namespace Saleae
             public readonly string HouseName;
             public readonly string HouseId;
             public readonly string HouseToken;
+            [JsonProperty]
             public readonly List<LightPad> LightPads;
-
+            [JsonIgnoreAttribute]
             public byte Brightness
             {
-                get; set;
+                get
+                {
+                    string status_json = LightPads.First().PlumCommand("getLogicalLoadMetrics", new Dictionary<string, string>() { { "llid", LogicalLoadId } });
+                    dynamic status = JObject.Parse(status_json);
+                    return (byte)status.level;
+                }
+                set
+                {
+                    var data = new { level = (int)value, llid = LogicalLoadId };
+                    LightPads.First().PlumCommand("setLogicalLoadLevel", data);
+                }
             }
-
         }
 
         public class LightPad
         {
-            public LightPad(EndPoint endpoint, string id)
+            public LightPad(string ip, int port, string id, string homeaccesstoken)
             {
-                Endpoint = endpoint;
+                Ip = ip;
+                Port = port;
                 Id = id;
+                HomeAccessToken = homeaccesstoken;
             }
-
-            public readonly EndPoint Endpoint;
+            public readonly string Ip;
+            public readonly int Port;
             public readonly string Id;
+            public string HomeAccessToken { get; set; }
 
-            public void PlumCommand(string url, Dictionary<string, string> data)
+            public string PlumCommand(string rest_command, object data)
             {
-                var client = new HttpClient();
 
-                var request_task = client.PostAsync("", new FormUrlEncodedContent(data));
+                string home_hash;
+                using (var algorithm = SHA256.Create())
+                {
+                    var hash = algorithm.ComputeHash(Encoding.UTF8.GetBytes(HomeAccessToken));
+                    home_hash = String.Join("", hash.Select(x => x.ToString("x2")));
+                }
 
-                request_task.Wait();
-                var response = request_task.Result;
-                string response_str = response.Content.ReadAsStringAsync().Result;
+                HttpClientHandler handler = new HttpClientHandler();
 
+                handler.ServerCertificateCustomValidationCallback = (a, b, c, d) => { return true; };
+
+                var client = new HttpClient(handler);
+
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("Plum/2.3.0 (iPhone; iOS 9.2.1; Scale/2.00)");
+                client.DefaultRequestHeaders.Add("X-Plum-House-Access-Token", home_hash);
+                string url = String.Format("https://{0}:{1}/v2/{2}", Ip, Port, rest_command);
+
+                var request_task = client.PostAsync(url, new StringContent(
+                    JsonConvert.SerializeObject(data), Encoding.UTF8, "application/json"
+                ));
+
+                string response_str = request_task.Result.Content.ReadAsStringAsync().Result;
+                return response_str;
             }
         }
+
     }
 }
